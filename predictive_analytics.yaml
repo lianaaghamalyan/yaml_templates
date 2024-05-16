@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create resource for predictive analysis on Timestream load data using Batch load 
+
+
+Resources:
+  MyDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: "Predictive_Analysis"
+
+  MyTable:
+    DependsOn: MyDatabase
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref MyDatabase
+      TableName : "Predicted_data"
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: "24"
+        MagneticStoreRetentionPeriodInDays: "7300"
+      MagneticStoreWriteProperties:
+        EnableMagneticStoreWrites: true
+
+  
+  S3Bucket:
+    DependsOn: MyTable
+    Type: 'AWS::S3::Bucket'
+    Description: S3 Bucket for Uploading CSV file 
+    Properties:
+      VersioningConfiguration:
+        Status: Suspended
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        # S3 API allows unencrypted traffic by default
+        - Sid: Require TLS
+          Effect: Deny
+          Principal: "*"
+          Action:
+          - "s3:*"
+          Resource:
+          - !Sub "${S3Bucket.Arn}/*"
+          Condition:
+            Bool:
+              "aws:SecureTransport": "false"
+
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      ReservedConcurrentExecutions : 1
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import boto3 
+          import cfnresponse
+
+          def batch_load():
+              
+              # parsing environment variable 
+              database_name=os.environ['database']
+              table_name=os.environ['table']
+              s3_target_bucket_arn=os.environ['target_bucket_name']
+              s3_target_bucket_location=s3_target_bucket_arn.split(':')[5]
+              s3_source_bucket_location='aws-blogs-artifacts-public' ## replace with database team public s3 bucket 
+              s3_source_key ='Historical_load_final.csv'
+              batchload_input_object_key_prefix = "batch_load_files" 
+              batchload_error_object_key_prefix = "batch_load_errors"
+              
+              #Initializing s3 and timestream clients
+              s3_client = boto3.client('s3')
+              timestream_client = boto3.client('timestream-write')
+              
+              #s3 copy csv file
+              try:
+                  response = s3_client.copy_object(
+                                  CopySource=f'{s3_source_bucket_location}/artifacts/DBBLOG-3596/{s3_source_key}',  # /Bucket-name/path/filename
+                                  Bucket=s3_target_bucket_location,                       # Destination bucket
+                                  Key= f'{batchload_input_object_key_prefix}/{s3_source_key}'       # Destination path/filename
+                              )
+                  print('s3 copy completed')          
+                  print(response)
+              except Exception as err:
+                  print("Copy s3 object failed to destination bucket:", err)
+                  raise
+              
+              
+              #data model used for batch load 
+              data_model = {
+                              "TimeUnit": "MILLISECONDS",
+                              "TimeColumn": "time",
+                              "DimensionMappings": [
+                                  {
+                                      "SourceColumn": "microservice_name",
+                                      "DestinationColumn": "microservice_name"
+                                  },
+                                  {
+                                      "SourceColumn": "region",
+                                      "DestinationColumn": "region"
+                                  }
+                              ],
+                              "MultiMeasureMappings": {
+                                  "MultiMeasureAttributeMappings": [
+                                      {
+                                          "SourceColumn": "memory_avg",
+                                          "TargetMultiMeasureAttributeName": "memory_avg",
+                                          "MeasureValueType": "DOUBLE"
+                                      },
+                                      {
+                                          "SourceColumn": "tps_avg",
+                                          "TargetMultiMeasureAttributeName": "tps_avg",
+                                          "MeasureValueType": "DOUBLE"
+                                      },
+                                      {
+                                          "SourceColumn": "cpu_avg",
+                                          "TargetMultiMeasureAttributeName": "cpu_avg",
+                                          "MeasureValueType": "DOUBLE"
+                                      }
+                                  ]
+                              },
+                              "MeasureNameColumn": "measure_name"
+                          }
+              
+              #perform timestream batchload 
+              try:
+                  result = timestream_client.create_batch_load_task(TargetDatabaseName=database_name, TargetTableName=table_name,
+                                                        DataModelConfiguration={"DataModel": data_model
+                                                        },
+                                                        DataSourceConfiguration={
+                                                            "DataSourceS3Configuration": {
+                                                                "BucketName": s3_target_bucket_location,
+                                                                "ObjectKeyPrefix": batchload_input_object_key_prefix
+                                                            },
+                                                            "DataFormat": "CSV"
+                                                        },
+                                                        ReportConfiguration={
+                                                            "ReportS3Configuration": {
+                                                                "BucketName":  s3_target_bucket_location,
+                                                                "ObjectKeyPrefix": batchload_error_object_key_prefix,
+                                                                "EncryptionOption": "SSE_S3",
+                                                            }
+                                                        }
+                                                        )
+
+                  task_id = result["TaskId"]
+                  print("Successfully created batch load task: ", task_id)
+                  return task_id
+              except Exception as err:
+                  print("Create batch load task job failed:", err)
+                  raise  
+                  
+          def lambda_handler(event,context):
+            print('----event---')
+            print(event)
+            print('----context---')
+            print(context)
+            if event.get('RequestType') == 'Create':
+              response = batch_load()
+              message = f"response {response}"
+              responseData = {}
+              responseData['message'] = message
+              logging.info('Sending %s to cloudformation', responseData['message'])
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            elif event.get('RequestType') == 'Delete':
+              responseData = {}
+              responseData['message'] = "Performing Nothing from Lambda"
+              logging.info('Sending %s to cloudformation', responseData['message'])
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            else:
+              logging.error('Unknown operation: %s', event.get('RequestType'))
+             
+
+
+      Description: load data into Timestream table
+      Environment:
+        Variables:
+          database: !Ref MyDatabase
+          table: !GetAtt MyTable.Name
+          target_bucket_name : !GetAtt S3Bucket.Arn
+      Handler: index.lambda_handler
+      MemorySize: 200
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 120
+
+
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      - !Ref LambdaPolicy
+
+  LambdaPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: "Allow role to copy s3 objects and perform Timestream batch load"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:PutObjectTagging
+            Resource:
+              - !Sub "${S3Bucket.Arn}/*"
+              - !Sub "${S3Bucket.Arn}"
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectTagging 
+            Resource:
+              - "arn:aws:s3:::aws-blogs-artifacts-public/artifacts/DBBLOG-3596/Historical_load_final.csv"      
+          - Effect: Allow
+            Action:
+              - timestream:WriteRecords
+              - timestream:Select
+              - timestream:CreateBatchLoadTask
+            Resource:
+              - !GetAtt MyTable.Arn
+          - Effect: Allow
+            Action:
+              - timestream:DescribeEndpoints 
+            Resource:
+              - "*" #restricted with timestream action
+
+  CustomResource:
+    Type: "Custom::CustomResource"
+    DependsOn: S3Bucket
+    Properties:
+      ServiceToken: !GetAtt
+        - Lambda
+        - Arn
+      Region: !Ref "AWS::Region"
+
+  CustomManagedkey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "key for notebook instance"
+
+  NotebookForPredicton:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      InstanceType: "ml.t2.large"
+      RoleArn: !GetAtt PredictiveAnalysisTimestreamRole.Arn
+      LifecycleConfigName: !GetAtt JupyterNotebookInstanceLifecycleConfig.NotebookInstanceLifecycleConfigName
+      KmsKeyId: !Ref CustomManagedkey
+
+  JupyterNotebookInstanceLifecycleConfig:
+        Type: "AWS::SageMaker::NotebookInstanceLifecycleConfig"
+        Properties:
+          OnStart:
+            - Content:
+                Fn::Base64: |
+                  #!/bin/bash
+                  sudo -u ec2-user -i <<EOF
+                  cd /home/ec2-user/SageMaker
+                  source activate python3
+                  aws s3 cp s3://aws-blogs-artifacts-public/artifacts/DBBLOG-3596/timestream_predictive_analysis.ipynb .
+                  EOF
+
+  PredictiveAnalysisTimestreamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "sagemaker.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+      - !Ref PATPolicy
+      - "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+      - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+      - "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
+
+
+  PATPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: "Allow required access for PredictiveAnalysisTimestreamRole"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+            - timestream:WriteRecords
+            - timestream:Select
+          Resource:
+            - !GetAtt MyTable.Arn
+        - Effect: Allow
+          Action:
+            - timestream:DescribeEndpoints 
+          Resource:
+            - "*" #restricted with timestream action
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:GetObjectTagging 
+          Resource:
+            - "arn:aws:s3:::aws-blogs-artifacts-public/artifacts/DBBLOG-3596/timestream_predictive_analysis.ipynb" 
+        - Effect: Allow
+          Action:
+            - kms:*
+          Resource:
+            - !GetAtt CustomManagedkey.Arn
+
+
+Outputs:
+  NotebookInstanceName:
+    Description:  Notebook Instance Name
+    Value: !Ref NotebookForPredicton
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref S3Bucket 
